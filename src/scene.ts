@@ -1,4 +1,5 @@
 import YAML from "yaml";
+import { tableWidth } from "./widths.js";
 
 // Reads a flowreel scene (YAML text) into plain objects and places the blocks that have no position.
 // No Node or browser APIs here, so it runs anywhere.
@@ -43,7 +44,7 @@ const STYLES = ["minimal", "glow"];
 const SHAPES = ["box", "rect", "pill", "circle"] as const;
 const LAYOUTS = ["auto", "circle", "row", "column", "grid"];
 const SIDES: Record<string, Pt> = { "right-of": [1, 0], "left-of": [-1, 0], above: [0, -1], below: [0, 1] };
-const FLAGS: Record<string, [string, boolean]> = { dashed: ["dashed", true], solid: ["dashed", false], flow: ["flow", true] };
+const FLAGS: Record<string, [string, boolean]> = { dashed: ["dashed", true], solid: ["dashed", false], flow: ["flow", true], noflow: ["flow", false] };
 const TIME_RE = /^(\d+(?:\.\d+)?|\.\d+)(s|ms)?$/;
 
 export type Block = {
@@ -58,6 +59,7 @@ export type Block = {
   at: Pt | null; // where the file pins it
   beside: [string, string, number] | null; // (side, other block, gap) when placed next to another block
   hidden: boolean;
+  sized: boolean; // the file gave a size, so it never grows to fit its label
   pos: Pt; // where it ends up at the start
 };
 
@@ -73,8 +75,15 @@ export type Arrow = {
   width: number | null; // null means the style's own line width
 };
 
+// What a `set` step changes. Anything left out stays as it was.
+export type Look = { colour?: RGB; fill?: RGB; text?: RGB; label?: string; flow?: boolean; dashed?: boolean };
+
 export type Action = {
-  kind: "ball" | "show" | "hide" | "move" | "say" | "pause";
+  kind: "ball" | "show" | "hide" | "move" | "say" | "pause" | "pulse" | "set";
+  background: boolean; // written with a trailing &: starts with its step, but the next step doesn't wait for it
+  label: string | null; // the text that travels with a ball
+  arrow: number | null; // for `set a -> b`: which arrow
+  look: Look | null; // for `set`: what changes
   time: number;
   src: string;
   dst: string;
@@ -148,7 +157,7 @@ function splitLine(text: string): [string[], string | null] {
   return [text.split(/\s+/).filter(Boolean), label];
 }
 
-type Options = { time?: number; colour?: RGB; ease?: string; dashed?: boolean; flow?: boolean; curve?: number; width?: number; size?: number };
+type Options = { time?: number; colour?: RGB; fill?: RGB; text?: RGB; ease?: string; dashed?: boolean; flow?: boolean; curve?: number; width?: number; size?: number };
 
 // Turns words like 0.6s, blue, dashed, ease=out into settings.
 function readOptions(tokens: string[], where: string, allowed: string[], theme: string): Options {
@@ -166,7 +175,7 @@ function readOptions(tokens: string[], where: string, allowed: string[], theme: 
     else [key, val] = ["colour", tok];
     if (!allowed.includes(key)) throw new FlowError(`${where}: '${tok}' doesn't fit here. This line takes: ${allowed.join(", ")}.`);
     if (key === "time") out.time = parseTime(val, where);
-    else if (key === "colour") out.colour = parseColour(val, where, theme);
+    else if (key === "colour" || key === "fill" || key === "text") out[key] = parseColour(val, where, theme);
     else if (key === "ease") {
       if (!EASES[String(val)]) throw new FlowError(`${where}: ease=${val} isn't known. Use ${Object.keys(EASES).join(", ")}.`);
       out.ease = val;
@@ -205,6 +214,7 @@ function parseBlock(name: string, raw: unknown, size: Pt, where: string, theme: 
     w,
     h,
     hidden: Boolean(raw.hidden),
+    sized: "size" in raw,
     edge: edge != null ? parseColour(edge, where, theme) : null,
     fill: "fill" in raw ? parseColour(raw.fill, where, theme) : null,
     text: "text" in raw ? parseColour(raw.text, where, theme) : null,
@@ -236,11 +246,20 @@ function parseArrow(text: string, blocks: Record<string, Block>, theme: string):
 
 const MOVE_RE = /^\s*move\s+(\w+)\s+to\s+\[?\s*([-\d.]+)\s*,\s*([-\d.]+)\s*\]?(.*)$/;
 const action = (a: Partial<Action> & Pick<Action, "kind">): Action => ({
-  time: 1, src: "", dst: "", colour: null, ease: "smooth", size: null, to: null, text: "", ...a,
+  time: 1, src: "", dst: "", colour: null, ease: "smooth", size: null, to: null, text: "",
+  background: false, label: null, arrow: null, look: null, ...a,
 });
 
-function parseAction(text: string, blocks: Record<string, Block>, size: Pt, theme: string): Action {
+function parseAction(text: string, blocks: Record<string, Block>, arrows: Arrow[], size: Pt, theme: string): Action {
   const where = `step '${text}'`;
+  // a trailing & means: start this, and let the next step begin without waiting for it
+  const background = /&\s*$/.test(text);
+  const a = parseOne(text.replace(/&\s*$/, ""), where, blocks, arrows, size, theme);
+  if (background && a.kind === "pause") throw new FlowError(`${where}: a pause can't run in the background; it would do nothing.`);
+  return { ...a, background };
+}
+
+function parseOne(text: string, where: string, blocks: Record<string, Block>, arrows: Arrow[], size: Pt, theme: string): Action {
   const [tokens, label] = splitLine(text);
   if (!tokens.length) throw new FlowError(`${where}: empty step.`);
   const needBlock = (n: string) => {
@@ -262,6 +281,34 @@ function parseAction(text: string, blocks: Record<string, Block>, size: Pt, them
     const o = readOptions(tokens.slice(2), where, ["time", "ease"], theme);
     return action({ kind: word, src: needBlock(tokens[1]), time: o.time ?? 0.4, ease: o.ease ?? "smooth" });
   }
+  if (word === "pulse") {
+    if (tokens.length < 2) throw new FlowError(`${where}: write it like 'pulse B 1s'.`);
+    const o = readOptions(tokens.slice(2), where, ["time", "colour"], theme);
+    return action({ kind: "pulse", src: needBlock(tokens[1]), time: o.time ?? 0.6, colour: o.colour ?? null });
+  }
+  if (word === "set") {
+    if (tokens.length >= 4 && ["->", "<->", "--"].includes(tokens[2])) {
+      const [x, y] = [needBlock(tokens[1]), needBlock(tokens[3])];
+      const i = arrows.findIndex((ar) => (ar.a === x && ar.b === y) || (ar.a === y && ar.b === x));
+      if (i < 0) throw new FlowError(`${where}: there's no arrow between '${x}' and '${y}' in arrows:.`);
+      const o = readOptions(tokens.slice(4), where, ["colour", "flow", "dashed", "time"], theme);
+      const look: Look = {};
+      if (o.colour) look.colour = o.colour;
+      if (o.flow !== undefined) look.flow = o.flow;
+      if (o.dashed !== undefined) look.dashed = o.dashed;
+      if (!Object.keys(look).length) throw new FlowError(`${where}: say what changes, like 'set ${x} -> ${y} flow', 'noflow', 'dashed' or a colour.`);
+      return action({ kind: "set", arrow: i, look, time: o.time ?? 0.3 });
+    }
+    if (tokens.length < 2) throw new FlowError(`${where}: write it like 'set B green "done"'.`);
+    const o = readOptions(tokens.slice(2), where, ["colour", "fill", "text", "time"], theme);
+    const look: Look = {};
+    if (o.colour) look.colour = o.colour;
+    if (o.fill) look.fill = o.fill;
+    if (o.text) look.text = o.text;
+    if (label != null) look.label = label;
+    if (!Object.keys(look).length) throw new FlowError(`${where}: say what changes, like a colour, fill=green, text=white or a new label in quotes.`);
+    return action({ kind: "set", src: needBlock(tokens[1]), look, time: o.time ?? 0.3 });
+  }
   if (word === "move") {
     const m = text.match(MOVE_RE);
     if (!m) throw new FlowError(`${where}: write it like 'move B to 300,200 1s' or 'move B to 0.5,0.5'.`);
@@ -271,14 +318,119 @@ function parseAction(text: string, blocks: Record<string, Block>, size: Pt, them
   if (tokens.length >= 3 && tokens[1] === "->") {
     const o = readOptions(tokens.slice(3), where, ["time", "colour", "ease", "size"], theme);
     return action({
-      kind: "ball", src: needBlock(tokens[0]), dst: needBlock(tokens[2]),
+      kind: "ball", src: needBlock(tokens[0]), dst: needBlock(tokens[2]), label,
       time: o.time ?? 1, colour: o.colour ?? null, ease: o.ease ?? "smooth", size: o.size ?? null,
     });
   }
-  throw new FlowError(`${where}: expected 'A -> B', 'pause', 'say', 'show', 'hide' or 'move'.`);
+  throw new FlowError(`${where}: expected 'A -> B', 'pause', 'say', 'show', 'hide', 'move', 'pulse', 'set' or 'repeat'.`);
 }
 
-export function parseScene(source: string): Scene {
+const REPEAT_RE = /^\s*repeat\s+(\d+)\s*\[(.*)\]\s*$/;
+const MAX_REPEAT = 100;
+
+// Splits "a -> b, say \"x, y\"" on the commas that are outside quotes.
+function splitTop(text: string): string[] {
+  const parts: string[] = [];
+  let cur = "";
+  let quote = "";
+  for (const ch of text) {
+    if (quote) quote = ch === quote ? "" : quote;
+    else if (ch === '"' || ch === "'") quote = ch;
+    else if (ch === ",") {
+      parts.push(cur);
+      cur = "";
+      continue;
+    }
+    cur += ch;
+  }
+  parts.push(cur);
+  return parts.map((p) => p.trim()).filter(Boolean);
+}
+
+function repeatCount(value: unknown, where: string): number {
+  const n = parseNumber(value, where, "repeat");
+  if (!Number.isInteger(n) || n < 1 || n > MAX_REPEAT) throw new FlowError(`${where}: repeat takes a whole number from 1 to ${MAX_REPEAT}.`);
+  return n;
+}
+
+// The steps list, with repeats written out. Each step is the actions that start together.
+function parseSteps(list: unknown, blocks: Record<string, Block>, arrows: Arrow[], size: Pt, theme: string): Action[][] {
+  const steps: Action[][] = [];
+  const one = (t: unknown) => parseAction(String(t), blocks, arrows, size, theme);
+  for (const item of Array.isArray(list) ? list : list == null ? [] : [list]) {
+    if (isObj(item)) {
+      // - repeat: 3
+      //   steps: [...]
+      if (!("repeat" in item)) {
+        throw new FlowError(`step ${JSON.stringify(item)}: a ': ' inside a step makes YAML read it as a setting. Drop the colon, or wrap the whole step in single quotes.`);
+      }
+      const where = `repeat ${JSON.stringify(item.repeat)}`;
+      const extra = Object.keys(item).filter((k) => k !== "repeat" && k !== "steps");
+      if (extra.length) throw new FlowError(`${where}: unknown setting '${extra[0]}'. A repeat has repeat: and steps:.`);
+      const inner = parseSteps(item.steps, blocks, arrows, size, theme);
+      if (!inner.length) throw new FlowError(`${where}: add the steps to repeat under steps:.`);
+      for (let i = repeatCount(item.repeat, where); i > 0; i--) steps.push(...inner);
+      continue;
+    }
+    const m = typeof item === "string" ? item.match(REPEAT_RE) : null;
+    if (m) {
+      // repeat 3 [a -> b, say "x"]: the bracket runs together, three times over
+      const step = splitTop(m[2]).map(one);
+      if (!step.length) throw new FlowError(`step '${item}': put what to repeat inside the brackets.`);
+      for (let i = repeatCount(m[1], `step '${item}'`); i > 0; i--) steps.push(step);
+      continue;
+    }
+    const items: unknown[] = Array.isArray(item) ? item : [item];
+    if (items.some(isObj))
+      throw new FlowError(`step ${JSON.stringify(item)}: a ': ' inside a step makes YAML read it as a setting. Drop the colon, or wrap the whole step in single quotes.`);
+    if (items.length) steps.push(items.map(one));
+  }
+  return steps;
+}
+
+// How wide some text is drawn, in pixels.
+type Measure = (text: string, size: number, weight: number) => number;
+
+// A one-line label split into two lines at the space nearest its middle, when that makes it narrower.
+function twoLines(label: string, width: (s: string) => number): string {
+  if (label.includes("\n") || !label.includes(" ")) return label;
+  let best = label;
+  let bestWidth = width(label);
+  for (let i = label.indexOf(" "); i >= 0; i = label.indexOf(" ", i + 1)) {
+    const w = Math.max(width(label.slice(0, i)), width(label.slice(i + 1)));
+    if (w < bestWidth) [best, bestWidth] = [label.slice(0, i) + "\n" + label.slice(i + 1), w];
+  }
+  return best;
+}
+
+// Blocks without a size of their own widen (and circles grow) so every label they will show fits.
+// A circle first wraps a long label onto two lines, since growing to fit one long line makes it huge.
+function fitLabels(sc: Scene, measure: Measure) {
+  const [size, weight] = sc.style === "minimal" ? [14, 500] : [17, 600];
+  for (const b of Object.values(sc.blocks)) {
+    if (b.sized) continue;
+    const sets = sc.steps.flat().filter((a) => a.kind === "set" && a.src === b.name && a.look?.label != null);
+    if (b.shape === "circle") {
+      const widest = (l: string) => Math.max(...l.split("\n").map((line) => measure(line, size, weight)));
+      const wrap = (l: string) => (widest(l) <= b.w * 0.72 ? l : twoLines(l, (x) => measure(x, size, weight)));
+      b.label = wrap(b.label);
+      // later labels only wrap if they don't fit the size the first label needs
+      b.w = b.h = Math.ceil(Math.max(b.w, widest(b.label) / 0.72));
+      for (const a of sets) a.look = { ...a.look, label: wrap(a.look!.label!) };
+    }
+    const labels = [b.label, ...sets.map((a) => a.look!.label!)];
+    const lines = labels.flatMap((l) => l.split("\n"));
+    const widest = Math.max(...lines.map((line) => measure(line, size, weight)));
+    const tall = Math.max(...labels.map((l) => l.split("\n").length)) * size * 1.25;
+    if (b.shape === "circle") b.w = b.h = Math.ceil(Math.max(b.w, widest / 0.72, (tall + 16) / 0.72));
+    else {
+      b.w = Math.ceil(Math.max(b.w, widest / 0.86));
+      b.h = Math.ceil(Math.max(b.h, tall + 22));
+    }
+  }
+}
+
+export function parseScene(source: string, measure: Measure = tableWidth): Scene {
   let raw: unknown;
   try {
     raw = YAML.parse(source);
@@ -317,13 +469,7 @@ export function parseScene(source: string): Scene {
     if (b.beside && !blocks[b.beside[1]]) throw new FlowError(`block ${b.name}: ${b.beside[0]} '${b.beside[1]}', but there's no such block.`);
 
   const arrows = (Array.isArray(raw.arrows) ? raw.arrows : raw.arrows == null ? [] : [raw.arrows]).map((a) => parseArrow(String(a), blocks, themeName));
-  const steps: Action[][] = [];
-  for (const item of Array.isArray(raw.steps) ? raw.steps : raw.steps == null ? [] : [raw.steps]) {
-    const items: unknown[] = Array.isArray(item) ? item : [item];
-    if (items.some(isObj))
-      throw new FlowError(`step ${JSON.stringify(item)}: a ': ' inside a step makes YAML read it as a setting. Drop the colon, or wrap the whole step in single quotes.`);
-    if (items.length) steps.push(items.map((t) => parseAction(String(t), blocks, size, themeName)));
-  }
+  const steps = parseSteps(raw.steps, blocks, arrows, size, themeName);
 
   const sc: Scene = {
     size,
@@ -345,6 +491,7 @@ export function parseScene(source: string): Scene {
     arrows,
     steps,
   };
+  fitLabels(sc, measure);
   place(sc);
   return sc;
 }

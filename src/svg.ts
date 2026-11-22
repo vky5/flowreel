@@ -1,5 +1,8 @@
 import { Timeline, arrowCurve, linkCurve, measureCurve, type Curve } from "./geom.js";
 import type { Block, Pt, RGB, Scene } from "./scene.js";
+
+type BlockLook = { edge: RGB | null; fill: RGB | null; text: RGB | null; label: string };
+type ArrowLook = { colour: RGB | null; dashed: boolean; flow: boolean };
 import { tableWidth } from "./widths.js";
 
 // Writes a scene as one SVG that animates itself on a loop, using only SVG's own animation tags
@@ -170,6 +173,44 @@ export class Writer {
     return k;
   }
 
+  // Every distinct look something takes during the loop, and how visible each one is over time,
+  // so that a `set` cross-fades from the old look to the new one.
+  looks<T>(first: T, changes: [number, number, T][]): { looks: T[]; keys: Keys<number>[] } {
+    const looks = [first];
+    const ids = [JSON.stringify(first)];
+    const keys = [new Keys(1)];
+    let cur = 0;
+    for (const [t0, t1, look] of changes) {
+      let i = ids.indexOf(JSON.stringify(look));
+      if (i < 0) {
+        looks.push(look);
+        ids.push(JSON.stringify(look));
+        keys.push(new Keys(0));
+        i = looks.length - 1;
+      }
+      if (i === cur) continue;
+      keys[cur].go(t0, t1, 0, "smooth");
+      keys[i].go(t0, t1, 1, "smooth");
+      cur = i;
+    }
+    return { looks, keys };
+  }
+
+  // The text riding along with a ball, just above it.
+  ballLabel(label: string, size: number, colour: RGB) {
+    const th = this.scene.theme;
+    const y = -(size + 13);
+    if (this.scene.style === "minimal") {
+      const w = this.textWidth(label, 11, 500) + 10;
+      return `<g transform="translate(0 ${n(y)})"><rect x="${n(-w / 2)}" y="-9" width="${n(w)}" height="18" rx="4" fill="${hexc(th.bg)}" opacity="0.9"/>${this.text(label, 11, th.text, 500)}</g>`;
+    }
+    const w = this.textWidth(label, 11, 600) + 14;
+    return (
+      `<g transform="translate(0 ${n(y)})"><rect x="${n(-w / 2)}" y="-10" width="${n(w)}" height="20" rx="10" fill="${hexc(th.fill)}" stroke="${hexc(colour)}" stroke-width="1"/>` +
+      `${this.text(label, 11, th.text, 600)}</g>`
+    );
+  }
+
   // ---- drawing ----
 
   shape(block: Block, pad: number, attrs: string) {
@@ -193,9 +234,9 @@ export class Writer {
   }
 
   // The biggest font size, from `biggest` down to 12, that keeps the label inside the block.
-  labelSize(block: Block, biggest: number, weight: number) {
+  labelSize(block: Block, biggest: number, weight: number, label = block.label) {
     const room = block.w * (block.shape === "circle" ? 0.72 : 0.86);
-    for (let size = biggest; size >= 12; size--) if (this.textWidth(block.label, size, weight) <= room) return size;
+    for (let size = biggest; size >= 12; size--) if (this.textWidth(label, size, weight) <= room) return size;
     return 12;
   }
 
@@ -230,6 +271,19 @@ export class Writer {
         op[a.src].go(start, end, 0, a.ease);
         if (!mini) scale[a.src].go(start, end, 0.94, a.ease);
       } else if (a.kind === "move") place[a.src].go(start, end, a.to!, a.ease);
+      else if (a.kind === "pulse") {
+        ringColour[a.src].set(start, a.colour ?? ball.colour);
+        for (let c = start; c < end - 1e-6; c += 0.6) {
+          const e = Math.min(c + 0.6, end);
+          const peak = c + (e - c) * 0.3;
+          ring[a.src].go(c, peak, 0.85, "out");
+          ring[a.src].go(peak, e, 0, "in");
+          if (!mini) {
+            scale[a.src].go(c, peak, 1.03, "out");
+            scale[a.src].go(peak, e, 1, "in");
+          }
+        }
+      }
       else if (a.kind === "ball") {
         ringColour[a.dst].set(end, a.colour ?? ball.colour);
         ring[a.dst].go(end, end + 0.06, 1, "linear");
@@ -258,17 +312,35 @@ export class Writer {
       }
     }
 
-    for (const ar of sc.arrows) {
-      const colour = ar.colour ?? th.arrow;
+    sc.arrows.forEach((ar, index) => {
       const width = ar.width ?? (mini ? 1.25 : 2);
       const [d, mid] = this.linkKeys(ar.a, ar.b, ar.curve);
       const vis = this.seenKeys([ar.a, ar.b]);
-      const attrs = [`d="${d.start}"`, `fill="none"`, `stroke="${hexc(colour)}"`, `stroke-width="${n(width)}"`];
-      if (ar.heads !== "none") attrs.push(`marker-end="${this.head(colour, width)}"`);
-      if (ar.heads === "both") attrs.push(`marker-start="${this.head(colour, width)}"`);
-      if (ar.dashed || ar.flow) attrs.push(`stroke-dasharray="6 7"`);
-      const flow = ar.flow ? `<animate attributeName="stroke-dashoffset" values="13;0" dur="0.7s" repeatCount="indefinite"/>` : "";
-      layers.arrows.push(`<path ${attrs.join(" ")} opacity="${n(vis.start)}">${this.anim(d, "d")}${flow}${this.anim(vis, "opacity", (v) => n(v))}</path>`);
+      // the arrow's looks over time, from its own settings and any `set a -> b` steps
+      let now: ArrowLook = { colour: ar.colour, dashed: ar.dashed, flow: ar.flow };
+      const changes: [number, number, ArrowLook][] = [];
+      for (const [start, a] of this.tl.events)
+        if (a.kind === "set" && a.arrow === index) {
+          now = { colour: a.look!.colour ?? now.colour, dashed: a.look!.dashed ?? now.dashed, flow: a.look!.flow ?? now.flow };
+          changes.push([start, start + a.time, now]);
+        }
+      const { looks, keys } = this.looks<ArrowLook>({ colour: ar.colour, dashed: ar.dashed, flow: ar.flow }, changes);
+      const path = (look: ArrowLook, opacity: string, fade: string) => {
+        const colour = look.colour ?? th.arrow;
+        const attrs = [`d="${d.start}"`, `fill="none"`, `stroke="${hexc(colour)}"`, `stroke-width="${n(width)}"`];
+        if (ar.heads !== "none") attrs.push(`marker-end="${this.head(colour, width)}"`);
+        if (ar.heads === "both") attrs.push(`marker-start="${this.head(colour, width)}"`);
+        if (look.dashed || look.flow) attrs.push(`stroke-dasharray="6 7"`);
+        const flow = look.flow ? `<animate attributeName="stroke-dashoffset" values="13;0" dur="0.7s" repeatCount="indefinite"/>` : "";
+        return `<path ${attrs.join(" ")} opacity="${opacity}">${this.anim(d, "d")}${flow}${fade}</path>`;
+      };
+      if (looks.length === 1) layers.arrows.push(path(looks[0], n(vis.start), this.anim(vis, "opacity", (v) => n(v))));
+      else
+        layers.arrows.push(
+          `<g opacity="${n(vis.start)}">${this.anim(vis, "opacity", (v) => n(v))}` +
+            looks.map((look, i) => path(look, n(keys[i].start), this.anim(keys[i], "opacity", (v) => n(v)))).join("") +
+            `</g>`,
+        );
       if (ar.label) {
         let chip: string;
         if (mini) {
@@ -286,7 +358,7 @@ export class Writer {
             `<g transform="translate(${pt(mid.start)})">${this.animTransform(mid, "translate", pt)}${chip}</g></g>`,
         );
       }
-    }
+    });
 
     if (!mini) {
       const shadow = sc.themeName === "dark" ? "0.45" : "0.12";
@@ -294,31 +366,45 @@ export class Writer {
       this.defs.set("ringblur", `<filter id="ringblur" x="-40%" y="-40%" width="180%" height="180%"><feGaussianBlur stdDeviation="5"/></filter>`);
     }
     for (const b of Object.values(blocks)) {
-      const fill = b.fill ?? th.fill;
-      const edge = b.edge ?? th.edge;
-      // the ring that lights up when a ball lands, then the block itself
-      let ringGlow = "";
-      let ringLine: string;
-      let body: string;
-      let label: string;
-      if (mini) {
-        ringLine = this.shape(b, 0, `stroke-width="1.5"`);
-        body = this.shape(b, 0, `fill="${hexc(fill)}" stroke="${hexc(edge)}" stroke-width="1"`);
-        label = this.text(b.label, this.labelSize(b, 14, 500), b.text ?? th.text, 500);
-      } else {
-        const top = b.fill ? mix(WHITE, fill, 0.06) : th.fill_top;
-        ringGlow = this.shape(b, 4, `stroke-width="6" filter="url(#ringblur)"`);
-        ringLine = this.shape(b, 1.5, `stroke-width="2"`);
-        body = this.shape(b, 0, `fill="${this.gradientFill(top, fill)}" stroke="${hexc(edge)}" stroke-width="1.5" filter="url(#shadow)"`);
-        label = this.text(b.label, this.labelSize(b, 17, 600), b.text ?? th.text);
-      }
+      // the ring that lights up when a ball lands or the block pulses
+      const ringGlow = mini ? "" : this.shape(b, 4, `stroke-width="6" filter="url(#ringblur)"`);
+      const ringLine = mini ? this.shape(b, 0, `stroke-width="1.5"`) : this.shape(b, 1.5, `stroke-width="2"`);
+      // the block itself, once per look it takes; `set` steps cross-fade between them
+      const first: BlockLook = { edge: b.edge, fill: b.fill, text: b.text, label: b.label };
+      let now = first;
+      const changes: [number, number, BlockLook][] = [];
+      for (const [start, a] of this.tl.events)
+        if (a.kind === "set" && a.src === b.name) {
+          const l = a.look!;
+          now = { edge: l.colour ?? now.edge, fill: l.fill ?? now.fill, text: l.text ?? now.text, label: l.label ?? now.label };
+          changes.push([start, start + a.time, now]);
+        }
+      const draw = (look: BlockLook) => {
+        const fill = look.fill ?? th.fill;
+        const edge = look.edge ?? th.edge;
+        if (mini)
+          return (
+            this.shape(b, 0, `fill="${hexc(fill)}" stroke="${hexc(edge)}" stroke-width="1"`) +
+            this.text(look.label, this.labelSize(b, 14, 500, look.label), look.text ?? th.text, 500)
+          );
+        const top = look.fill ? mix(WHITE, fill, 0.06) : th.fill_top;
+        return (
+          this.shape(b, 0, `fill="${this.gradientFill(top, fill)}" stroke="${hexc(edge)}" stroke-width="1.5" filter="url(#shadow)"`) +
+          this.text(look.label, this.labelSize(b, 17, 600, look.label), look.text ?? th.text)
+        );
+      };
+      const { looks, keys } = this.looks(first, changes);
+      const bodies =
+        looks.length === 1
+          ? draw(looks[0])
+          : looks.map((look, i) => `<g opacity="${n(keys[i].start)}">${this.anim(keys[i], "opacity", (v) => n(v))}${draw(look)}</g>`).join("");
       layers.blocks.push(
         `<g opacity="${n(op[b.name].start)}">${this.anim(op[b.name], "opacity", (v) => n(v))}` +
           `<g transform="translate(${pt(b.pos)})">${this.animTransform(place[b.name], "translate", pt)}` +
           `<g transform="scale(${n(scale[b.name].start)})">${this.animTransform(scale[b.name], "scale", (v) => n(v))}` +
           `<g opacity="0" fill="none">${this.anim(ring[b.name], "opacity", (v) => n(v))}` +
           `<g stroke="${hexc(ball.colour)}">${this.anim(ringColour[b.name], "stroke", hexc)}${ringGlow}${ringLine}</g></g>` +
-          `${body}${label}</g></g></g>`,
+          `${bodies}</g></g></g>`,
       );
     }
 
@@ -338,6 +424,7 @@ export class Writer {
       const end = start + a.time;
       const colour = a.colour ?? ball.colour;
       const size = a.size ?? ball.size;
+      const tag = a.label ? this.ballLabel(a.label, size, colour) : "";
       const progress = new Keys(0);
       progress.go(start, end, 1, a.ease);
       const shown = new Keys(0);
@@ -345,7 +432,7 @@ export class Writer {
       if (mini) {
         // just a small dot
         shown.go(end - 0.05, end, 0, "linear");
-        layers.balls.push(`<g opacity="0">${this.anim(shown, "opacity", (v) => n(v))}${this.motion(progress, id)}<circle r="${n(size)}" fill="${hexc(colour)}"/></g>`);
+        layers.balls.push(`<g opacity="0">${this.anim(shown, "opacity", (v) => n(v))}${this.motion(progress, id)}<circle r="${n(size)}" fill="${hexc(colour)}"/>${tag}</g>`);
         return;
       }
       shown.go(end, end + 0.1, 0, "linear");
@@ -367,7 +454,7 @@ export class Writer {
       layers.balls.push(
         `<g opacity="0">${this.anim(shown, "opacity", (v) => n(v))}${this.motion(progress, id)}` +
           `<circle r="${n(size * 2.6)}" fill="${hexc(colour)}" opacity="${n(th.glow * 0.6)}" filter="url(#glowblur)"/>` +
-          `<circle r="${n(size)}" fill="${this.ballCore(colour)}"/></g>`,
+          `<circle r="${n(size)}" fill="${this.ballCore(colour)}"/>${tag}</g>`,
       );
     });
 

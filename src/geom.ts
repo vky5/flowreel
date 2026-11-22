@@ -69,11 +69,18 @@ export class Timeline {
 
   constructor(private scene: Scene) {
     let t = 0;
+    let end = 0;
     for (const step of scene.steps) {
-      for (const a of step) this.events.push([t, a]);
-      t += Math.max(...step.map((a) => a.time));
+      for (const a of step) {
+        this.events.push([t, a]);
+        end = Math.max(end, t + a.time);
+      }
+      // the next step waits for this one's foreground actions; background (&) ones keep running alongside
+      const waits = step.filter((a) => !a.background).map((a) => a.time);
+      t += waits.length ? Math.max(...waits) : 0;
     }
-    this.total = t;
+    this.events.sort((x, y) => x[0] - y[0]);
+    this.total = Math.max(t, end); // a background action may still be running after the last step
   }
 
   blocksAt(t: number): { pos: Record<string, Pt>; seen: Record<string, number> } {

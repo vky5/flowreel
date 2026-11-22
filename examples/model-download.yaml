@@ -1,0 +1,21 @@
+# A worker asks for a model; the download runs in the background while it keeps working.
+theme: light
+blocks:
+  worker: {label: Worker}
+  guard: {label: Guard}
+  store: {label: Model store, shape: circle}
+  results: {label: A results folder, shape: circle}
+arrows:
+  - worker -> guard
+  - guard -> store
+  - worker -> results dashed
+steps:
+  - worker -> guard "want [model.pt]"
+  - pulse guard 1.2s
+  - set guard green "allowed"
+  - set guard -> store flow
+  - guard -> store 4s teal "download" &
+  - repeat 3 [store -> guard 0.5s blue "chunk"]
+  - set guard -> store noflow
+  - worker -> results "write"
+  - set results green "3 results"
