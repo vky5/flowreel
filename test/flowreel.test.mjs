@@ -111,3 +111,65 @@ test("preview serves the drawing and reports mistakes", async () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ---- 0.2.0: labels on dots, background steps, set, repeat, pulse, labels that fit ----
+
+const two = "blocks:\n  a: A\n  b: B\narrows:\n  - a -> b\n";
+
+test("a ball can carry a label that travels with it", () => {
+  const svg = renderFlowreel(two + 'steps:\n  - a -> b "want [model.pt]"\n');
+  const ball = svg.slice(svg.indexOf('<g class="balls">'));
+  assert.ok(ball.includes("want [model.pt]"), "label sits inside the moving ball group");
+});
+
+test("& starts an action and lets the next steps run alongside it", () => {
+  const steps = (amp) => `steps:\n  - a -> b 10s${amp}\n  - b -> a 1s\n  - b -> a 1s\n`;
+  // 10s background ball overlaps the two 1s balls, so the loop is 10s + 0.55s landing glow + 0.6s hold
+  assert.ok(Math.abs(render(two + steps(" &")).duration - 11.15) < 1e-9);
+  assert.ok(Math.abs(render(two + steps("")).duration - 13.15) < 1e-9);
+  assert.throws(() => renderFlowreel(two + "steps:\n  - pause 1s &\n"), /can't run in the background/);
+});
+
+test("set changes a block's colour and label, cross-fading between looks", () => {
+  const svg = renderFlowreel("blocks:\n  job: {label: running}\nsteps:\n  - pause 1s\n  - set job green \"done\"\n");
+  assert.ok(svg.includes(">running<") && svg.includes(">done<"));
+  assert.equal((svg.match(/>done</g) ?? []).length, 1);
+  assert.ok(svg.includes(`stroke="#4ade80"`), "green outline in the second look");
+});
+
+test("set turns an arrow's flow on and off", () => {
+  const svg = renderFlowreel(two + "steps:\n  - set a -> b flow\n  - pause 2s\n  - set a -> b noflow\n");
+  assert.equal((svg.match(/attributeName="stroke-dashoffset" values="13;0"/g) ?? []).length, 1, "one flowing look");
+  assert.ok((svg.match(/marker-end=/g) ?? []).length >= 2, "a solid look and a flowing look");
+  assert.throws(() => renderFlowreel(two + "steps:\n  - set b -> c flow\n"), /no block called 'c'/);
+  assert.throws(() => renderFlowreel("blocks: {a: A, b: B}\nsteps:\n  - set a -> b flow\n"), /no arrow between 'a' and 'b'/);
+  assert.throws(() => renderFlowreel(two + "steps:\n  - set a\n"), /say what changes/);
+});
+
+test("repeat writes steps out several times", () => {
+  const count = (yaml) => (renderFlowreel(two + yaml).match(/<animateMotion/g) ?? []).length;
+  assert.equal(count("steps:\n  - repeat 3 [b -> a 0.4s blue]\n"), 3);
+  assert.equal(count('steps:\n  - repeat 2 [a -> b, say "a, b"]\n'), 2, "commas inside quotes don't split");
+  assert.equal(count("steps:\n  - repeat: 2\n    steps:\n      - a -> b\n      - b -> a\n"), 4);
+  assert.throws(() => renderFlowreel(two + "steps:\n  - repeat 0 [a -> b]\n"), /whole number from 1 to 100/);
+  assert.throws(() => renderFlowreel(two + "steps:\n  - repeat: 2\n    do: [a -> b]\n"), /unknown setting 'do'/);
+});
+
+test("pulse makes a block's outline breathe for its duration", () => {
+  const svg = renderFlowreel("blocks:\n  b: B\nsteps:\n  - pulse b 1.2s amber\n");
+  const ring = svg.match(/<g opacity="0" fill="none"><animate attributeName="opacity"[^>]*values="([^"]*)"/);
+  assert.ok(ring, "the ring is animated");
+  assert.equal(ring[1].split(";").filter((v) => v === "0.85").length, 2, "two 0.6s breaths in 1.2s");
+});
+
+test("blocks without a size grow so their labels fit", () => {
+  const big = parseScene("blocks:\n  r: {label: A results folder, shape: circle}\n").blocks.r;
+  assert.ok(big.w > 76 && big.w < 110 && big.w === big.h, `circle grew to ${big.w}, wrapping rather than growing huge`);
+  assert.equal(big.label, "A results\nfolder");
+  const done = parseScene("blocks:\n  r: {label: A results folder, shape: circle}\nsteps:\n  - set r \"3 results\"\n");
+  assert.equal(done.steps[0][0].look.label, "3 results", "a later label that fits stays on one line");
+  assert.equal(renderFlowreel("blocks:\n  r: {label: A results folder, shape: circle}\n").match(/font-size="(\d+)"/)[1], "14");
+  const later = parseScene("blocks:\n  j: {label: run}\nsteps:\n  - set j \"waiting for the very long download\"\n").blocks.j;
+  assert.ok(later.w > 124, "grows for labels set later too");
+  assert.equal(parseScene("blocks:\n  r: {label: A results folder, shape: circle, size: 60}\n").blocks.r.w, 60, "an explicit size is kept");
+});

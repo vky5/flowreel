@@ -26,7 +26,8 @@ const autoMeasure: Measure = (text, size, weight) => {
 
 // The SVG and how long one loop lasts, in seconds. Throws FlowError when the scene has a mistake.
 export function render(source: string, options: Options = {}): { svg: string; duration: number } {
-  const writer = new Writer(parseScene(source), options.measure ?? autoMeasure);
+  const measure = options.measure ?? autoMeasure;
+  const writer = new Writer(parseScene(source, measure), measure);
   return { svg: writer.render(), duration: writer.total };
 }
 
