@@ -1,6 +1,6 @@
 {
   "name": "@vky5/flowreel",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Animated diagrams from a small YAML file: blocks, arrows and dots moving between them, drawn as an SVG that animates itself.",
   "keywords": [
     "diagram",
