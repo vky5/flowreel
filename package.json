@@ -1,0 +1,58 @@
+{
+  "name": "@vky5/flowreel",
+  "version": "0.1.0",
+  "description": "Animated diagrams from a small YAML file: blocks, arrows and dots moving between them, drawn as an SVG that animates itself.",
+  "keywords": [
+    "diagram",
+    "animation",
+    "svg",
+    "yaml",
+    "architecture",
+    "sequence",
+    "flow"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vky5/flowreel.git"
+  },
+  "homepage": "https://github.com/vky5/flowreel#readme",
+  "bugs": {
+    "url": "https://github.com/vky5/flowreel/issues"
+  },
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "flowreel": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "npm run build && node --test test/",
+    "prepublishOnly": "npm test"
+  },
+  "dependencies": {
+    "yaml": "^2.9.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "typescript": "^5"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

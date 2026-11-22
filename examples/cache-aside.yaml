@@ -1,0 +1,26 @@
+# A cache-aside read: the first request misses and fills the cache, the second one hits.
+theme: dark
+blocks:
+  client: {label: Client, shape: pill}
+  api:    {label: API}
+  cache:  {label: Cache, colour: blue}
+  db:     {label: Postgres, shape: circle, size: 84, hidden: true}
+arrows:
+  - client -> api
+  - api <-> cache curve=0.2 "lookup"
+  - api -> db dashed
+steps:
+  - client -> api
+  - api -> cache 0.6s blue
+  - [cache -> api 0.6s red, say "cache miss" 0.9s]
+  - show db 0.4s
+  - api -> db 0.7s
+  - db -> api 0.7s green
+  - api -> cache 0.5s green
+  - api -> client
+  - pause 0.4s
+  - [hide db 0.5s, say "second request hits the cache" 1.4s]
+  - client -> api 0.6s
+  - api -> cache 0.4s blue
+  - cache -> api 0.4s green
+  - api -> client 0.6s
